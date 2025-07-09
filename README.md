@@ -161,10 +161,26 @@ cargo run -- ./my_photos --undo
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+This project is licensed under the MIT License.
 
 ## Acknowledgments
 
-- [Blake3](https://github.com/BLAKE3-team/BLAKE3) for fast cryptographic hashing
-- [Rayon](https://github.com/rayon-rs/rayon) for data parallelism
-- [img_hash](https://github.com/abonander/img_hash) for perceptual image hashing
+
+### Special Thanks
+This project was developed as part of an internship mini project. Special gratitude to my mentors who guided me through learning Rust and provided invaluable support:
+
+- **[Sourav Mishra](https://www.linkedin.com/in/web3-mishra/)**
+- **[Mahavir Ganpati Dash](https://www.linkedin.com/in/crypto-priest/)**
+- **[Sumeet Naik](https://www.linkedin.com/in/sumeetnaik19/)**
+
+
+Their mentorship went beyond just teaching Rust - they provided thoughtful guidance, collaborative support, and always focused on what would genuinely help us grow as developers. Their friendly approach and future-oriented thinking made this learning journey both enjoyable and meaningful.
+
+This project will continue to be developed and enhanced with new features and optimizations.
+
+## Future Development
+This deduplicator is actively being developed with planned features including:
+- GUI interface for easier usage
+- More file type support (videos, documents)
+- Advanced similarity algorithms
+- Performance optimizations
