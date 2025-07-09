@@ -1,26 +1,14 @@
 {
-  "./test_folder\\img7.jpg": {
-    "path": "./test_folder\\img7.jpg",
-    "modified": 1752088194,
-    "size": 95600,
-    "hash": "f13d55a7edf68c3d59507553f4c3063f3116c7a7b55a37ed2e4286556eb872d3"
+  "./test_folder\\.quarantine_log.json": {
+    "path": "./test_folder\\.quarantine_log.json",
+    "modified": 1752092033,
+    "size": 222,
+    "hash": "79f064eaf7d6a8b81584d17e9f685b787db68d2817676062f0c82f260c4a92c2"
   },
   "./test_folder\\.dedup_cache.json": {
     "path": "./test_folder\\.dedup_cache.json",
-    "modified": 1752090966,
-    "size": 2050,
-    "hash": "a7b882a875e6b209363860b37194e7af430f237d5944466bb620dba6c46148f1"
-  },
-  "./test_folder\\file3.txt": {
-    "path": "./test_folder\\file3.txt",
-    "modified": 1752090180,
-    "size": 24,
-    "hash": "490dd8c39e5239733bb2b635d4414a97763d985eb8306edd404db4785a7c5190"
-  },
-  "./test_folder\\img6.jpg": {
-    "path": "./test_folder\\img6.jpg",
-    "modified": 1752088169,
-    "size": 1344562,
-    "hash": "4018fc0deb422512ab1e68700a7183744817de917922423a2cfaa54a82747fb9"
+    "modified": 1752092031,
+    "size": 2616,
+    "hash": "d38cc1ddb71140a4b3c153d7c71d787a001a49ea40390cb47e22e1b9967b9841"
   }
 }
