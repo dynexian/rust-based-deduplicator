@@ -2,20 +2,22 @@ use walkdir::WalkDir;
 use std::path::PathBuf;
 use std::fs::File;
 use std::io::{BufReader, Read};
-use blake3;
 use std::collections::HashMap;
 use rayon::prelude::*;
 use std::env;
 use std::time::SystemTime;
-use std::fs;
 use regex::Regex;
 use serde::{Serialize, Deserialize};
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use img_hash::{HasherConfig, HashAlg};
 
+// ============================================================================
+// STRUCTS & ENUMS
+// ============================================================================
 
 pub struct FileFilter {
-    pub min_size: Option<u64>,       // in bytes
+    pub min_size: Option<u64>,
     pub max_size: Option<u64>,
     pub allowed_extensions: Option<Vec<String>>,
     pub modified_after: Option<SystemTime>,
@@ -36,7 +38,7 @@ enum HashAlgo {
 #[derive(Serialize)]
 struct DuplicateGroup {
     hash: String,
-    similarity: Option<f64>,  // New field
+    similarity: Option<f64>,
     files: Vec<String>,
 }
 
@@ -47,12 +49,6 @@ struct FullReport {
     groups: Vec<DuplicateGroup>,
 }
 
-// #[derive(Serialize)]
-// struct SimilarEntry {
-//     similarity: f64,         // in %
-//     files: Vec<String>,      // the similar files
-// }
-
 #[derive(Clone, Serialize, Deserialize)]
 struct CachedFile {
     path: String,
@@ -61,68 +57,14 @@ struct CachedFile {
     hash: String,
 }
 
-
-
-// fn collect_all_files(dir: &str, filter: &FileFilter, regex: Option<&Regex>) -> Vec<PathBuf> {
-//     WalkDir::new(dir)
-//         .into_iter()
-//         .filter_map(|entry| {
-//             let entry = entry.ok()?;
-//             let path = entry.path();
-
-//             // Skip .quarantine and hidden folders
-//             if path.components().any(|c| c.as_os_str() == ".quarantine") {
-//                 return None;
-//             }
-//             if entry.file_type().is_dir() {
-//                 return None;
-//             }
-
-//             let meta = entry.metadata().ok()?;
-//             let size = meta.len();
-//             let modified = meta.modified().ok()?;
-
-//             if let Some(min) = filter.min_size {
-//                 if size < min {
-//                     return None;
-//                 }
-//             }
-
-//             if let Some(max) = filter.max_size {
-//                 if size > max {
-//                     return None;
-//                 }
-//             }
-
-//             if let Some(after) = filter.modified_after {
-//                 if modified < after {
-//                     return None;
-//                 }
-//             }
-
-//             if let Some(ref exts) = filter.allowed_extensions {
-//                 let file_ext = entry.path().extension()?.to_str()?.to_lowercase();
-//                 if !exts.contains(&file_ext) {
-//                     return None;
-//                 }
-//             }
-
-//             if let Some(rgx) = regex {
-//                 let filename = entry.file_name().to_string_lossy();
-//                 if !rgx.is_match(&filename) {
-//                     return None;
-//                 }
-//             }
-
-//             Some(path.to_path_buf())
-//         })
-//         .collect()
-// }
+// ============================================================================
+// CORE FUNCTIONS
+// ============================================================================
 
 fn hash_file(path: &PathBuf, algo: &HashAlgo) -> Option<String> {
     let file = File::open(path).ok()?;
     let mut reader = BufReader::new(file);
-    let mut buffer = [0u8; 4096];
+    let mut buffer = [0u8; 8192]; // Increased buffer size for better performance
 
     match algo {
         HashAlgo::Blake3 => {
@@ -154,185 +96,160 @@ fn hash_file(path: &PathBuf, algo: &HashAlgo) -> Option<String> {
     }
 }
 
-// fn group_duplicates(files: Vec<PathBuf>, algo: &HashAlgo) -> HashMap<String, Vec<PathBuf>> {
-//     let args: Vec<String> = std::env::args().collect();
-//     let folder = args.get(1).expect("Please provide a folder path"); 
-//     let cache_path = format!("{}/.dedup_cache.json", folder);
-//     let cache_map: HashMap<String, CachedFile> = if let Ok(data) = std::fs::read_to_string(&cache_path) {
-//         serde_json::from_str(&data).unwrap_or_default()
-//     } else {
-//         HashMap::new()
-//     };
+fn collect_files_parallel(dir: &str, filter: &FileFilter, regex: Option<&Regex>) -> Vec<PathBuf> {
+    println!("🔄 Scanning files recursively in {}...", dir);
     
-//     let mut new_cache: HashMap<String, CachedFile> = HashMap::new();
-//     let hashes_and_cache: Vec<((String, PathBuf), Option<CachedFile>)> = files
-//         .into_par_iter()
-//         .filter_map(|path| {
-//             let meta = path.metadata().ok()?;
-//             let modified = meta.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
-//             let size = meta.len();
-//             let path_str = path.display().to_string();
+    // Use sequential scanning to avoid race conditions
+    let mut results = Vec::new();
+    
+    for entry in WalkDir::new(dir) {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                println!("❌ Error reading entry: {}", e);
+                continue;
+            }
+        };
+        
+        let path = entry.path();
 
-//             if let Some(cached) = cache_map.get(&path_str) {
-//                 if cached.modified == modified && cached.size == size {
-//                     return Some(((cached.hash.clone(), path), None));
-//                 }
-//             }
+        // Skip quarantine and directories
+        if path.components().any(|c| c.as_os_str() == ".quarantine") {
+            continue;
+        }
+        
+        if entry.file_type().is_dir() {
+            continue;
+        }
 
-//             let hash = hash_file(&path, algo)?;
-//             let cached_file = CachedFile {
-//                 path: path_str.clone(),
-//                 modified,
-//                 size,
-//                 hash: hash.clone(),
-//             };
+        println!("📁 Found: {}", path.display());
 
-//             Some(((hash, path), Some(cached_file)))
-//         })
-//         .collect();
+        let meta = match entry.metadata() {
+            Ok(m) => m,
+            Err(e) => {
+                println!("   ❌ Failed to get metadata: {}", e);
+                continue;
+            }
+        };
+        
+        let size = meta.len();
 
-//     for ((_, _), cache_entry) in &hashes_and_cache {
-//         if let Some(cached_file) = cache_entry {
-//             new_cache.insert(cached_file.path.clone(), cached_file.clone());
-//         }
-//     }
-//     let hashes: Vec<(String, PathBuf)> = hashes_and_cache.into_iter().map(|(hp, _)| hp).collect();
+        // Apply filters
+        if let Some(min) = filter.min_size { 
+            if size < min { 
+                println!("   ⏭️ Skipped: size {} < min {}", size, min);
+                continue; 
+            } 
+        }
+        if let Some(max) = filter.max_size { 
+            if size > max { 
+                println!("   ⏭️ Skipped: size {} > max {}", size, max);
+                continue; 
+            } 
+        }
+        if let Some(after) = filter.modified_after { 
+            if let Ok(modified) = meta.modified() {
+                if modified < after { 
+                    println!("   ⏭️ Skipped: too old");
+                    continue; 
+                }
+            }
+        }
+        if let Some(ref exts) = filter.allowed_extensions {
+            if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                let file_ext = ext.to_lowercase();
+                if !exts.contains(&file_ext) { 
+                    println!("   ⏭️ Skipped: extension {} not allowed", file_ext);
+                    continue; 
+                }
+            } else {
+                println!("   ⏭️ Skipped: no extension");
+                continue;
+            }
+        }
+        if let Some(rgx) = regex {
+            if !rgx.is_match(&entry.file_name().to_string_lossy()) { 
+                println!("   ⏭️ Skipped: doesn't match regex");
+                continue; 
+            }
+        }
 
-//     let mut map: HashMap<String, Vec<PathBuf>> = HashMap::new();
-//     for (hash, path) in hashes {
-//         map.entry(hash).or_default().push(path);
-//     }
-//     let _ = std::fs::write(
-//     cache_path,
-//     serde_json::to_string_pretty(&new_cache).unwrap()
-//     );
-//     map
-// }
+        println!("   ✅ Included");
+        results.push(path.to_path_buf());
+    }
+    
+    println!("📊 Total files collected: {}", results.len());
+    results
+}
 
 fn group_duplicates_parallel(files: Vec<PathBuf>, algo: &HashAlgo) -> HashMap<String, Vec<PathBuf>> {
     let args: Vec<String> = std::env::args().collect();
-    let folder = args.get(1).expect("Please provide a folder path"); 
+    let folder = args.get(1).expect("Please provide a folder path");
     let cache_path = format!("{}/.dedup_cache.json", folder);
     
-    println!("🔄 Loading cache...");
-    let cache_map: HashMap<String, CachedFile> = if let Ok(data) = std::fs::read_to_string(&cache_path) {
-        serde_json::from_str(&data).unwrap_or_default()
-    } else {
-        HashMap::new()
-    };
+    // Load cache
+    let cache_map: HashMap<String, CachedFile> = std::fs::read_to_string(&cache_path)
+        .ok()
+        .and_then(|data| serde_json::from_str(&data).ok())
+        .unwrap_or_default();
     
     let cache_map = Arc::new(cache_map);
     let new_cache = Arc::new(Mutex::new(HashMap::<String, CachedFile>::new()));
-    let progress_counter = Arc::new(AtomicUsize::new(0));
-    let total_files = files.len();
+    let progress = Arc::new(AtomicUsize::new(0));
+    let total = files.len();
     
-    println!("🔄 Hashing {} files in parallel using {} threads...", total_files, rayon::current_num_threads());
+    println!("🔄 Hashing {} files using {} threads...", total, rayon::current_num_threads());
     
-    let hashes_and_cache: Vec<((String, PathBuf), Option<CachedFile>)> = files
+    let results: Vec<((String, PathBuf), Option<CachedFile>)> = files
         .into_par_iter()
         .filter_map(|path| {
-            let current = progress_counter.fetch_add(1, Ordering::Relaxed);
-            if current % 100 == 0 || current == total_files - 1 {
-                println!("📊 Hashing progress: {}/{} files", current + 1, total_files);
-            }
+            let current = progress.fetch_add(1, Ordering::Relaxed);
+            if current % 100 == 0 { println!("📊 Progress: {}/{}", current + 1, total); }
 
             let meta = path.metadata().ok()?;
             let modified = meta.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
             let size = meta.len();
             let path_str = path.display().to_string();
 
-            // Check cache
+            // Check cache hit
             if let Some(cached) = cache_map.get(&path_str) {
                 if cached.modified == modified && cached.size == size {
                     return Some(((cached.hash.clone(), path), None));
                 }
             }
 
-            // Cache miss - calculate new hash
+            // Cache miss - calculate hash
             let hash = hash_file(&path, algo)?;
-            let cached_file = CachedFile {
-                path: path_str.clone(),
-                modified,
-                size,
-                hash: hash.clone(),
-            };
-
+            let cached_file = CachedFile { path: path_str, modified, size, hash: hash.clone() };
             Some(((hash, path), Some(cached_file)))
         })
         .collect();
 
-    println!("✅ Hashing completed! Updating cache...");
-
-    // Update cache with new entries
-    for ((_, _), cache_entry) in &hashes_and_cache {
+    // Update cache
+    for ((_, _), cache_entry) in &results {
         if let Some(cached_file) = cache_entry {
-            let mut cache = new_cache.lock().unwrap();
-            cache.insert(cached_file.path.clone(), cached_file.clone());
+            new_cache.lock().unwrap().insert(cached_file.path.clone(), cached_file.clone());
         }
     }
 
-    // Group files by hash
+    // Group by hash
     let mut map: HashMap<String, Vec<PathBuf>> = HashMap::new();
-    for ((hash, path), _) in hashes_and_cache {
+    for ((hash, path), _) in results {
         map.entry(hash).or_default().push(path);
     }
 
-    // Save updated cache
-    let final_cache = new_cache.lock().unwrap();
-    let _ = std::fs::write(
-        cache_path,
-        serde_json::to_string_pretty(&*final_cache).unwrap()
-    );
-
-    println!("✅ Found {} duplicate groups", 
-        map.iter().filter(|(_, paths)| paths.len() > 1).count());
-
+    // Save cache
+    let _ = std::fs::write(cache_path, serde_json::to_string_pretty(&*new_cache.lock().unwrap()).unwrap());
+    
+    println!("✅ Found {} duplicate groups", map.iter().filter(|(_, paths)| paths.len() > 1).count());
     map
 }
 
-// fn save_json_report(path: &str, map: HashMap<String, Vec<PathBuf>>, saved_bytes: u64) {
-//     let groups: Vec<DuplicateGroup> = map.into_iter()
-//         .filter(|(_, files)| files.len() > 1)
-//         .map(|(hash, files)| {
-//             let file_strs: Vec<String> = files.iter().map(|p| p.display().to_string()).collect();
-            
-//             // DEBUG: Show what we're processing
-//             println!("DEBUG: Processing group with hash: {}", hash);
-//             println!("DEBUG: Files: {:?}", file_strs);
-            
-//             let similarity = calculate_similarity_for_group(&files);
-            
-//             // DEBUG: Show calculated similarity
-//             println!("DEBUG: Calculated similarity: {:?}", similarity);
-
-//             DuplicateGroup {
-//                 hash,
-//                 similarity,
-//                 files: file_strs,
-//             }
-//         })
-//         .collect();
-
-//     let report = FullReport {
-//         saved_bytes,
-//         saved_mb: saved_bytes as f64 / (1024.0 * 1024.0),
-//         groups,
-//     };
-
-//     let json = serde_json::to_string_pretty(&report).unwrap();
-//     std::fs::write(path, json).expect("Failed to write JSON report");
-//     println!("\nSaved JSON report to {}", path);
-// }
-
 fn edit_distance(a: &str, b: &str) -> usize {
     let mut dp = vec![vec![0; b.len() + 1]; a.len() + 1];
-
-    for i in 0..=a.len() {
-        dp[i][0] = i;
-    }
-    for j in 0..=b.len() {
-        dp[0][j] = j;
-    }
+    
+    for i in 0..=a.len() { dp[i][0] = i; }
+    for j in 0..=b.len() { dp[0][j] = j; }
 
     for (i, ca) in a.chars().enumerate() {
         for (j, cb) in b.chars().enumerate() {
@@ -343,40 +260,270 @@ fn edit_distance(a: &str, b: &str) -> usize {
             };
         }
     }
-
     dp[a.len()][b.len()]
 }
 
+fn calculate_similarity(paths: &[PathBuf]) -> Option<f64> {
+    if paths.len() < 2 { return None; }
 
-fn quarantine_duplicates(map: HashMap<String, Vec<PathBuf>>, base_dir: &str, dry_run: bool) -> u64 {
-    let mut total_saved: u64 = 0;
-    let quarantine_dir = PathBuf::from(format!("{}/.quarantine", base_dir));
-    let mut log: Vec<QuarantineLogEntry> = Vec::new();
-
-    for files in map.values() {
-        if files.len() < 2 {
-            continue;
+    // Text files
+    if paths.iter().all(|f| f.extension().map(|e| e == "txt").unwrap_or(false)) {
+        let contents: Vec<_> = paths.iter()
+            .filter_map(|f| std::fs::read_to_string(f).ok())
+            .collect();
+        
+        if contents.len() < 2 { return Some(100.0); }
+        
+        let mut total_sim = 0.0;
+        let mut comparisons = 0;
+        
+        for i in 0..contents.len() {
+            for j in i+1..contents.len() {
+                let a_replaced = contents[i].replace("\r\n", "\n");
+                let a = a_replaced.trim();
+                let b_replaced = contents[j].replace("\r\n", "\n");
+                let b = b_replaced.trim();
+                
+                let sim = if a == b {
+                    100.0
+                } else {
+                    let max_len = a.len().max(b.len()).max(1);
+                    let dist = edit_distance(a, b);
+                    100.0 - (dist as f64 * 100.0 / max_len as f64)
+                };
+                
+                total_sim += sim;
+                comparisons += 1;
+            }
         }
+        
+        return Some(if comparisons > 0 { total_sim / comparisons as f64 } else { 100.0 });
+    }
+
+    // Image files
+    if paths.iter().all(|f| {
+        f.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| matches!(e.to_ascii_lowercase().as_str(), "jpg" | "jpeg" | "png" | "gif" | "bmp"))
+            .unwrap_or(false)
+    }) {
+        let hashes: Vec<_> = paths
+            .par_iter()
+            .filter_map(|path| {
+                let hasher = HasherConfig::new().hash_alg(HashAlg::Gradient).to_hasher();
+                img_hash::image::open(path).ok().map(|img| hasher.hash_image(&img))
+            })
+            .collect();
+
+        if hashes.len() < 2 { return Some(100.0); }
+
+        let pairs: Vec<_> = (0..hashes.len())
+            .flat_map(|i| (i+1..hashes.len()).map(move |j| (i, j)))
+            .collect();
+
+        let similarities: Vec<f64> = pairs
+            .par_iter()
+            .map(|(i, j)| {
+                let dist = hashes[*i].dist(&hashes[*j]);
+                let bits = hashes[*i].as_bytes().len() * 8;
+                100.0 - (dist as f64 * 100.0 / bits as f64)
+            })
+            .collect();
+
+        return Some(if similarities.is_empty() { 100.0 } else { 
+            similarities.iter().sum::<f64>() / similarities.len() as f64 
+        });
+    }
+
+    Some(100.0) // Exact duplicates
+}
+
+fn fuzzy_image_match(paths: &[PathBuf], threshold: u32) -> HashMap<String, Vec<PathBuf>> {
+    if paths.len() < 2 { return HashMap::new(); }
+
+    println!("🔍 Fuzzy matching {} images...", paths.len());
+    
+    let hashes: Vec<_> = paths
+        .par_iter()
+        .filter_map(|path| {
+            let hasher = HasherConfig::new().hash_alg(HashAlg::Gradient).to_hasher();
+            img_hash::image::open(path).ok().map(|img| (path.clone(), hasher.hash_image(&img)))
+        })
+        .collect();
+
+    let mut groups = Vec::new();
+    let mut processed = std::collections::HashSet::new();
+
+    for (i, (path1, hash1)) in hashes.iter().enumerate() {
+        if processed.contains(path1) { continue; }
+        
+        let mut group = vec![path1.clone()];
+        
+        for (path2, hash2) in hashes.iter().skip(i + 1) {
+            if processed.contains(path2) { continue; }
+            
+            if hash1.dist(hash2) <= threshold {
+                group.push(path2.clone());
+                processed.insert(path2.clone());
+            }
+        }
+        
+        if group.len() > 1 {
+            let similarity = 100.0 - (hash1.dist(&hashes.iter().find(|(p, _)| p == &group[1]).unwrap().1) as f64 * 100.0 / 64.0);
+            println!(" 🖼️ Fuzzy group: {} files ({:.1}% similar)", group.len(), similarity);
+            groups.push(group);
+        }
+        
+        processed.insert(path1.clone());
+    }
+
+    groups.into_iter().enumerate()
+        .map(|(i, group)| (format!("fuzzy_img_{}", i), group))
+        .collect()
+}
+
+fn fuzzy_text_match(paths: &[PathBuf], threshold: f64) -> HashMap<String, Vec<PathBuf>> {
+    if paths.len() < 2 { return HashMap::new(); }
+
+    println!("🔍 Fuzzy matching {} text files...", paths.len());
+    
+    // Debug: Show what text files we're processing
+    for path in paths {
+        println!("   📝 Processing: {}", path.display());
+        if let Ok(content) = std::fs::read_to_string(path) {
+            println!("      Content: {:?}", content.trim());
+        } else {
+            println!("      ❌ Failed to read file");
+        }
+    }
+    
+    // Read all text files
+    let contents: Vec<_> = paths
+        .iter()
+        .filter_map(|path| {
+            match std::fs::read_to_string(path) {
+                Ok(content) => {
+                    let cleaned = content.replace("\r\n", "\n").trim().to_string();
+                    println!("   ✅ Read {}: {} chars", path.display(), cleaned.len());
+                    Some((path.clone(), cleaned))
+                }
+                Err(e) => {
+                    println!("   ❌ Failed to read {}: {}", path.display(), e);
+                    None
+                }
+            }
+        })
+        .collect();
+
+    println!("📝 Successfully read {} text files", contents.len());
+
+    let mut groups = Vec::new();
+    let mut processed = std::collections::HashSet::new();
+
+    for (i, (path1, content1)) in contents.iter().enumerate() {
+        if processed.contains(path1) { continue; }
+        
+        let mut group = vec![path1.clone()];
+        
+        for (path2, content2) in contents.iter().skip(i + 1) {
+            if processed.contains(path2) { continue; }
+            
+            // Calculate similarity
+            let similarity = if content1 == content2 {
+                100.0
+            } else if content1.is_empty() && content2.is_empty() {
+                100.0  // Both empty files
+            } else {
+                let max_len = content1.len().max(content2.len()).max(1);
+                let dist = edit_distance(content1, content2);
+                100.0 - (dist as f64 * 100.0 / max_len as f64)
+            };
+            
+            println!("   📊 Similarity between {} and {}: {:.1}%", 
+                     path1.file_name().unwrap().to_string_lossy(),
+                     path2.file_name().unwrap().to_string_lossy(),
+                     similarity);
+            
+            if similarity >= threshold {
+                group.push(path2.clone());
+                processed.insert(path2.clone());
+            }
+        }
+        
+        if group.len() > 1 {
+            // Calculate actual similarity for the first pair
+            let first_similarity = if group.len() >= 2 {
+                let content2 = &contents.iter().find(|(p, _)| p == &group[1]).unwrap().1;
+                if content1 == content2 {
+                    100.0
+                } else {
+                    let max_len = content1.len().max(content2.len()).max(1);
+                    let dist = edit_distance(content1, content2);
+                    100.0 - (dist as f64 * 100.0 / max_len as f64)
+                }
+            } else {
+                100.0
+            };
+            
+            println!(" 📝 Fuzzy text group: {} files ({:.1}% similar)", group.len(), first_similarity);
+            for file in &group {
+                println!("    - {}", file.display());
+            }
+            groups.push(group);
+        }
+        
+        processed.insert(path1.clone());
+    }
+
+    groups.into_iter().enumerate()
+        .map(|(i, group)| (format!("fuzzy_txt_{}", i), group))
+        .collect()
+}
+
+fn quarantine_duplicates(map: &HashMap<String, Vec<PathBuf>>, base_dir: &str, dry_run: bool) -> u64 {
+    let mut total_saved = 0u64;
+    let quarantine_dir = PathBuf::from(format!("{}/.quarantine", base_dir));
+    let mut log = Vec::new();
+    let base_path = PathBuf::from(base_dir);
+
+    for files in map.values().filter(|files| files.len() > 1) {
         for file in files.iter().skip(1) {
             if let Ok(meta) = file.metadata() {
                 total_saved += meta.len();
             }
 
-            let filename = file.file_name().unwrap();
-            let dest = quarantine_dir.join(filename);
+            // Preserve directory structure in quarantine
+            let relative_path = if let Ok(rel) = file.strip_prefix(&base_path) {
+                rel
+            } else {
+                // Fallback if strip_prefix fails
+                file.file_name().map(|name| std::path::Path::new(name)).unwrap_or(file)
+            };
+            
+            let dest = quarantine_dir.join(relative_path);
+            
+            // Create parent directories in quarantine
+            if let Some(parent) = dest.parent() {
+                if !dry_run {
+                    if let Err(e) = std::fs::create_dir_all(parent) {
+                        eprintln!("Failed to create quarantine directory {}: {}", parent.display(), e);
+                        continue;
+                    }
+                }
+            }
 
             if dry_run {
-                println!("[Dry Run] Would quarantine: {}", file.display());
+                println!("[Dry Run] Would quarantine: {} -> {}", file.display(), dest.display());
             } else {
-                std::fs::create_dir_all(&quarantine_dir).expect("Failed to create quarantine folder");
-                if let Err(e) = std::fs::rename(file, &dest) {
-                    eprintln!("Failed to quarantine {}: {}", file.display(), e);
-                } else {
-                    println!("Quarantined: {}", file.display());
-                    log.push(QuarantineLogEntry {
-                        original: file.display().to_string(),
-                        quarantined: dest.display().to_string(),
-                    });
+                match std::fs::rename(file, &dest) {
+                    Ok(_) => {
+                        println!("Quarantined: {} -> {}", file.display(), dest.display());
+                        log.push(QuarantineLogEntry {
+                            original: file.display().to_string(),
+                            quarantined: dest.display().to_string(),
+                        });
+                    }
+                    Err(e) => eprintln!("Failed to quarantine {}: {}", file.display(), e),
                 }
             }
         }
@@ -384,509 +531,68 @@ fn quarantine_duplicates(map: HashMap<String, Vec<PathBuf>>, base_dir: &str, dry
 
     if !dry_run && !log.is_empty() {
         let log_path = format!("{}/.quarantine_log.json", base_dir);
-        let json = serde_json::to_string_pretty(&log).unwrap();
-        std::fs::write(log_path, json).expect("Failed to write quarantine log");
+        let _ = std::fs::write(log_path, serde_json::to_string_pretty(&log).unwrap());
     }
 
-    if dry_run {
-        println!("\n[Dry Run] No files were moved.");
-    }
     total_saved
 }
 
-fn fuzzy_text_match(paths: &[PathBuf], threshold: usize) -> HashMap<String, Vec<PathBuf>> {
-    let mut groups: Vec<Vec<PathBuf>> = Vec::new();
-
-    for path in paths {
-        let content = fs::read_to_string(path).unwrap_or_default();
-        let mut matched = false;
-
-        for group in &mut groups {
-            let first = fs::read_to_string(&group[0]).unwrap_or_default();
-            let distance = strsim::levenshtein(&first, &content);
-            if distance < threshold {
-                group.push(path.clone());
-                matched = true;
-                break;
-            }
-        }
-
-        if !matched {
-            groups.push(vec![path.clone()]);
-        }
-    }
-
-    let mut result = HashMap::new();
-    for group in groups {
-        if group.len() > 1 {
-            let id = group[0].display().to_string();
-            result.insert(id, group);
-        }
-    }
-
-    result
-}
-
-// fn fuzzy_image_match(paths: &[PathBuf], threshold: u32) -> HashMap<String, Vec<PathBuf>> {
-//     let hasher = HasherConfig::new().hash_alg(HashAlg::Gradient).to_hasher();
-//     let mut groups: Vec<Vec<PathBuf>> = Vec::new();
-
-//     for path in paths {
-//         if let Ok(img) = img_hash::image::open(path) {
-//             let hash = hasher.hash_image(&img);
-//             let mut matched = false;
-
-//             for group in &mut groups {
-//                 if let Ok(existing_img) = img_hash::image::open(&group[0]) {
-//                     let existing_hash = hasher.hash_image(&existing_img);
-//                     let distance = hash.dist(&existing_hash);
-//                     let bits = hash.as_bytes().len() * 8;
-//                     let similarity = 100.0 - (distance as f64 * 100.0 / bits as f64);
-
-//                     if distance <= threshold {
-//                         println!(" 🖼️ Fuzzy match: {} and {} (similarity: {:.2}%)", 
-//                             group[0].display(), path.display(), similarity);
-//                         group.push(path.clone());
-//                         matched = true;
-//                         break;
-//                     }
-//                 }
-//             }
-
-//             if !matched {
-//                 groups.push(vec![path.clone()]);
-//             }
-//         }
-//     }
-
-//     // Convert groups to HashMap format
-//     let mut result = HashMap::new();
-//     for group in groups {
-//         if group.len() > 1 {
-//             let key = format!("fuzzy_img_{}", group[0].display());
-//             result.insert(key, group);
-//         }
-//     }
-
-//     result
-// }
-
-fn fuzzy_image_match_parallel(paths: &[PathBuf], threshold: u32) -> HashMap<String, Vec<PathBuf>> {
-    if paths.len() < 2 {
-        return HashMap::new();
-    }
-
-    println!("🔍 Running parallel fuzzy image matching on {} images...", paths.len());
-    
-    use img_hash::{HasherConfig, HashAlg};
-    let progress_counter = Arc::new(AtomicUsize::new(0));
-    
-    // Parallel hashing phase - create hasher in each thread
-    let hash_results: Vec<_> = paths
-        .par_iter()
-        .map(|path| {
-            let current = progress_counter.fetch_add(1, Ordering::Relaxed);
-            if current % 50 == 0 || current == paths.len() - 1 {
-                println!("📊 Hashing progress: {}/{} images", current + 1, paths.len());
-            }
-
-            // Create a new hasher for each thread
-            let hasher = HasherConfig::new().hash_alg(HashAlg::Gradient).to_hasher();
-            
-            match img_hash::image::open(path) {
-                Ok(img) => Some((path.clone(), hasher.hash_image(&img))),
-                Err(_) => None,
-            }
+fn save_report(path: &str, map: &HashMap<String, Vec<PathBuf>>, saved_bytes: u64, similarity_cache: &HashMap<String, f64>) {
+    let groups: Vec<DuplicateGroup> = map
+        .iter()
+        .filter(|(_, files)| files.len() > 1)
+        .map(|(hash, files)| DuplicateGroup {
+            hash: hash.clone(),
+            similarity: similarity_cache.get(hash).copied(),
+            files: files.iter().map(|p| p.display().to_string()).collect(),
         })
         .collect();
 
-    let valid_hashes: Vec<_> = hash_results.into_iter().flatten().collect();
-    
-    if valid_hashes.len() < 2 {
-        return HashMap::new();
-    }
+    let report = FullReport {
+        saved_bytes,
+        saved_mb: saved_bytes as f64 / (1024.0 * 1024.0),
+        groups,
+    };
 
-    println!("✅ Hashed {}/{} images successfully", valid_hashes.len(), paths.len());
-
-    // Parallel comparison phase
-    let groups = Arc::new(Mutex::new(Vec::<Vec<PathBuf>>::new()));
-    let processed = Arc::new(Mutex::new(std::collections::HashSet::<PathBuf>::new()));
-    let comparison_counter = Arc::new(AtomicUsize::new(0));
-
-    (0..valid_hashes.len()).into_par_iter().for_each(|i| {
-        let (ref path1, ref hash1) = valid_hashes[i];
-        
-        // Check if already processed
-        {
-            let proc = processed.lock().unwrap();
-            if proc.contains(path1) {
-                return;
-            }
-        }
-
-        let mut current_group = vec![path1.clone()];
-
-        // Find similar images
-        for j in i+1..valid_hashes.len() {
-            let (ref path2, ref hash2) = valid_hashes[j];
-            
-            {
-                let proc = processed.lock().unwrap();
-                if proc.contains(path2) {
-                    continue;
-                }
-            }
-
-            let distance = hash1.dist(hash2);
-            let current = comparison_counter.fetch_add(1, Ordering::Relaxed);
-            if current % 1000 == 0 {
-                println!("📊 Comparison progress: {} comparisons completed", current);
-            }
-
-            if distance <= threshold {
-                current_group.push(path2.clone());
-                
-                // Mark as processed
-                let mut proc = processed.lock().unwrap();
-                proc.insert(path2.clone());
-            }
-        }
-
-        if current_group.len() > 1 {
-            let similarity = 100.0 - (hash1.dist(&valid_hashes.iter()
-                .find(|(p, _)| p == &current_group[1]).unwrap().1) as f64 * 100.0 / 64.0);
-            
-            println!(" 🖼️ Fuzzy match: {} files (similarity: {:.2}%)", 
-                     current_group.len(), similarity);
-
-            let mut groups_lock = groups.lock().unwrap();
-            groups_lock.push(current_group);
-        }
-
-        // Mark first image as processed
-        let mut proc = processed.lock().unwrap();
-        proc.insert(path1.clone());
-    });
-
-    // Convert to HashMap format
-    let final_groups = groups.lock().unwrap();
-    let mut result = HashMap::new();
-    
-    for (_i, group) in final_groups.iter().enumerate() {
-        let key = format!("fuzzy_img_{}", group[0].display());
-        result.insert(key, group.clone());
-    }
-
-    println!("✅ Fuzzy matching completed! Found {} groups", result.len());
-    result
+    std::fs::write(path, serde_json::to_string_pretty(&report).unwrap())
+        .expect("Failed to write report");
+    println!("📄 Report saved to {}", path);
 }
 
-// Stub for undo_quarantine (implement as needed)
 fn undo_quarantine(base_dir: &str) {
     let log_path = format!("{}/.quarantine_log.json", base_dir);
-    let log_data = match std::fs::read_to_string(&log_path) {
-        Ok(data) => data,
-        Err(_) => {
-            println!("No quarantine log found.");
-            return;
-        }
-    };
-
-    let entries: Vec<QuarantineLogEntry> = match serde_json::from_str(&log_data) {
-        Ok(e) => e,
-        Err(_) => {
-            println!("Failed to parse quarantine log.");
-            return;
-        }
-    };
+    let entries: Vec<QuarantineLogEntry> = std::fs::read_to_string(&log_path)
+        .ok()
+        .and_then(|data| serde_json::from_str(&data).ok())
+        .unwrap_or_default();
 
     for entry in entries {
         let from = std::path::Path::new(&entry.quarantined);
         let to = std::path::Path::new(&entry.original);
+        
         if let Some(parent) = to.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
+        
         match std::fs::rename(from, to) {
             Ok(_) => println!("Restored: {}", entry.original),
             Err(e) => println!("Failed to restore {}: {}", entry.original, e),
         }
     }
-
-    // Optionally, remove the quarantine log after restoring
+    
     let _ = std::fs::remove_file(&log_path);
 }
-fn print_similarity_for_group(paths: &Vec<PathBuf>) {
-    if paths.len() < 2 {
-        return;
-    }
 
-    println!("DEBUG: Checking similarity for {} files", paths.len());
-    for p in paths {
-        println!("DEBUG: File: {} (ext: {:?})", p.display(), p.extension());
-    }
-
-    // Check if all files are text files
-    let all_txt = paths.iter().all(|f| f.extension().map(|e| e == "txt").unwrap_or(false));
-    println!("DEBUG: All text files: {}", all_txt);
-    
-    if all_txt {
-        let contents: Vec<String> = paths.iter()
-            .map(|f| std::fs::read_to_string(f).unwrap_or_default())
-            .collect();
-
-        let mut total_similarity = 0.0;
-        let mut comparisons = 0;
-
-        for i in 0..contents.len() {
-            for j in i+1..contents.len() {
-                let a = contents[i].replace("\r\n", "\n").trim().to_string();
-                let b = contents[j].replace("\r\n", "\n").trim().to_string();
-                let max_len = a.len().max(b.len()).max(1);
-                let dist = edit_distance(&a, &b);
-                let sim = 100.0 - (dist as f64 * 100.0 / max_len as f64);
-                println!("   Text similarity between {} and {}: {:.2}%", 
-                    paths[i].display(), paths[j].display(), sim);
-                total_similarity += sim;
-                comparisons += 1;
-            }
-        }
-
-        if comparisons > 0 {
-            println!("   Average text similarity: {:.2}%", total_similarity / comparisons as f64);
-        }
-        return;
-    }
-
-    // Check if all files are images
-    let all_img = paths.iter().all(|f| {
-        f.extension()
-            .and_then(|e| e.to_str())
-            .map(|e| {
-                let e = e.to_ascii_lowercase();
-                e == "jpg" || e == "jpeg" || e == "png" || e == "gif" || e == "bmp"
-            })
-            .unwrap_or(false)
-    });
-    println!("DEBUG: All image files: {}", all_img);
-
-    if all_img {
-        println!("DEBUG: Processing image similarity...");
-        use img_hash::{HasherConfig, HashAlg};
-        let hasher = HasherConfig::new().hash_alg(HashAlg::Gradient).to_hasher();
-        let mut hashes = Vec::new();
-        
-        // Generate hashes for all images
-        for p in paths {
-            match img_hash::image::open(p) {
-                Ok(img) => {
-                    hashes.push((p, hasher.hash_image(&img)));
-                    println!("DEBUG: Successfully hashed image: {}", p.display());
-                }
-                Err(e) => {
-                    println!("DEBUG: Failed to open image {}: {}", p.display(), e);
-                }
-            }
-        }
-        
-        if hashes.len() < 2 {
-            println!("   Could not calculate image similarity (only {} images loaded)", hashes.len());
-            return;
-        }
-        
-        let mut total_similarity = 0.0;
-        let mut comparisons = 0;
-        
-        for i in 0..hashes.len() {
-            for j in i+1..hashes.len() {
-                let dist = hashes[i].1.dist(&hashes[j].1);
-                let bits = hashes[i].1.as_bytes().len() * 8;
-                let sim = 100.0 - (dist as f64 * 100.0 / bits as f64);
-                println!("   Image similarity between {} and {}: {:.2}%", 
-                    hashes[i].0.display(), hashes[j].0.display(), sim);
-                total_similarity += sim;
-                comparisons += 1;
-            }
-        }
-        
-        if comparisons > 0 {
-            println!("   Average image similarity: {:.2}%", total_similarity / comparisons as f64);
-        }
-    } else {
-        println!("DEBUG: Mixed file types or non-image files");
-        // For mixed file types or exact duplicates
-        println!("   File similarity: 100.00% (exact duplicates)");
-    }
-}
-
-
-fn calculate_similarity_for_group(paths: &Vec<PathBuf>) -> Option<f64> {
-    println!("DEBUG: calculate_similarity_for_group called with {} files", paths.len());
-    
-    if paths.len() < 2 {
-        println!("DEBUG: Less than 2 files, returning None");
-        return None;
-    }
-
-    // Check if all files are text files
-    if paths.iter().all(|f| f.extension().map(|e| e == "txt").unwrap_or(false)) {
-        println!("DEBUG: Processing text similarity...");
-        let contents: Vec<String> = paths.iter()
-            .map(|f| {
-                match std::fs::read_to_string(f) {
-                    Ok(content) => {
-                        println!("DEBUG: Successfully read text file: {}", f.display());
-                        content
-                    }
-                    Err(e) => {
-                        println!("DEBUG: Failed to read text file {}: {}", f.display(), e);
-                        String::new()
-                    }
-                }
-            })
-            .collect();
-
-        let mut total_similarity = 0.0;
-        let mut comparisons = 0;
-
-        for i in 0..contents.len() {
-            for j in i+1..contents.len() {
-                let a = contents[i].replace("\r\n", "\n").trim().to_string();
-                let b = contents[j].replace("\r\n", "\n").trim().to_string();
-                
-                if a == b {
-                    println!("DEBUG: Text files are identical");
-                    total_similarity += 100.0;
-                } else {
-                    let max_len = a.len().max(b.len()).max(1);
-                    let dist = edit_distance(&a, &b);
-                    let sim = 100.0 - (dist as f64 * 100.0 / max_len as f64);
-                    println!("DEBUG: Text similarity calculated: {:.2}%", sim);
-                    total_similarity += sim;
-                }
-                comparisons += 1;
-            }
-        }
-
-        if comparisons > 0 {
-            let avg = total_similarity / comparisons as f64;
-            println!("DEBUG: Average text similarity: {:.2}%", avg);
-            return Some(avg);
-        } else {
-            println!("DEBUG: No text comparisons made, returning 100.0");
-            return Some(100.0);
-        }
-    }
-
-    // Check if all files are images - USE PARALLEL VERSION
-    if paths.iter().all(|f| {
-        f.extension()
-            .and_then(|e| e.to_str())
-            .map(|e| {
-                let e = e.to_ascii_lowercase();
-                e == "jpg" || e == "jpeg" || e == "png" || e == "gif" || e == "bmp"
-            })
-            .unwrap_or(false)
-    }) {
-        return calculate_image_similarity_parallel(paths);
-    }
-
-    println!("DEBUG: Mixed files or exact duplicates, returning 100.0");
-    Some(100.0)
-}
-
-// fn compute_similarity(files: &[PathBuf]) -> Option<f64> {
-//     if files.len() < 2 {
-//         return None;
-//     }
-
-//     // Text files
-//     let all_txt = files.iter().all(|f| f.extension().map(|e| e == "txt").unwrap_or(false));
-//     if all_txt {
-//         let contents: Vec<String> = files.iter()
-//             .map(|f| std::fs::read_to_string(f).unwrap_or_default())
-//             .collect();
-
-//         let mut total_similarity = 0.0;
-//         let mut comparisons = 0;
-
-//         for i in 0..contents.len() {
-//             for j in i+1..contents.len() {
-//                 let a = contents[i].replace("\r\n", "\n").trim().to_string();
-//                 let b = contents[j].replace("\r\n", "\n").trim().to_string();
-//                 let max_len = a.len().max(b.len()).max(1);
-//                 let dist = edit_distance(&a, &b);
-//                 let sim = 100.0 - (dist as f64 * 100.0 / max_len as f64);
-//                 total_similarity += sim;
-//                 comparisons += 1;
-//             }
-//         }
-
-//         return if comparisons > 0 {
-//             Some(total_similarity / comparisons as f64)
-//         } else {
-//             Some(100.0)
-//         };
-//     }
-
-//     // Image files
-//     let all_img = files.iter().all(|f| {
-//         f.extension()
-//             .and_then(|e| e.to_str())
-//             .map(|e| {
-//                 let e = e.to_ascii_lowercase();
-//                 e == "jpg" || e == "jpeg" || e == "png" || e == "gif" || e == "bmp"
-//             })
-//             .unwrap_or(false)
-//     });
-
-//     if all_img {
-//         let hasher = HasherConfig::new().hash_alg(HashAlg::Gradient).to_hasher();
-//         let mut hashes = Vec::new();
-
-//         for p in files {
-//             if let Ok(img) = img_hash::image::open(p) {
-//                 hashes.push(hasher.hash_image(&img));
-//             }
-//         }
-
-//         if hashes.len() < 2 {
-//             return None;
-//         }
-
-//         let mut total_similarity = 0.0;
-//         let mut comparisons = 0;
-
-//         for i in 0..hashes.len() {
-//             for j in i+1..hashes.len() {
-//                 let dist = hashes[i].dist(&hashes[j]);
-//                 let bits = hashes[i].as_bytes().len() * 8;
-//                 let sim = 100.0 - (dist as f64 * 100.0 / bits as f64);
-//                 total_similarity += sim;
-//                 comparisons += 1;
-//             }
-//         }
-
-//         return if comparisons > 0 {
-//             Some(total_similarity / comparisons as f64)
-//         } else {
-//             Some(100.0)
-//         };
-//     }
-
-//     // Mixed/other file types (e.g., binary): consider exact duplicate
-//     Some(100.0)
-// }
+// ============================================================================
+// MAIN FUNCTION
+// ============================================================================
 
 fn main() {
-    // Configure optimal thread pool
-    let num_threads = num_cpus::get();
+    // Setup
     rayon::ThreadPoolBuilder::new()
-        .num_threads(num_threads)
+        .num_threads(num_cpus::get())
         .build_global()
         .expect("Failed to initialize thread pool");
-    
-    println!("🚀 Starting parallel deduplicator with {} threads", num_threads);
-    let start_time = std::time::Instant::now();
 
     let args: Vec<String> = env::args().collect();
     let folder = args.get(1).map(|s| s.as_str()).unwrap_or("./test_folder");
@@ -908,294 +614,174 @@ fn main() {
         .and_then(|i| args.get(i + 1))
         .and_then(|pattern| Regex::new(pattern).ok());
 
-    println!("Scanning folder: {}", folder);
-    if let Some(ref rgx) = regex_pattern {
-        println!("Using regex filter: {}", rgx);
-    } else {
-        println!("No regex filter applied. Scanning all files.");
-    }
-
-    // Use parallel file collection
-    let all_files = collect_all_files_parallel(
-        folder,
-        &FileFilter {
-            min_size: Some(1),
-            max_size: None,
-            allowed_extensions: None,
-            modified_after: None,
-        },
-        regex_pattern.as_ref(),
-    );
-
-    // Parallel file type classification
-    let (images, texts): (Vec<_>, Vec<_>) = all_files
-        .par_iter()
-        .partition_map(|path| {
-            if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                let ext = ext.to_ascii_lowercase();
-                if ext == "jpg" || ext == "jpeg" || ext == "png" || ext == "gif" || ext == "bmp" {
-                    rayon::iter::Either::Left(path.clone())
-                } else if ext == "txt" {
-                    rayon::iter::Either::Right(path.clone())
-                } else {
-                    rayon::iter::Either::Right(path.clone())
-                }
-            } else {
-                rayon::iter::Either::Right(path.clone())
-            }
-        });
-
-    println!("Found {} files total", all_files.len());
-    println!("Images found: {}", images.len());
-    println!("Texts found: {}", texts.len());
-
-    // Use parallel hashing
-    let mut duplicates_map = group_duplicates_parallel(all_files.clone(), &hash_algo);
-    
-    if use_fuzzy {
-        println!("DEBUG: Running parallel fuzzy matching...");
-        let fuzzy_text = fuzzy_text_match(&texts, 10);
-        println!("DEBUG: Fuzzy text groups: {}", fuzzy_text.len());
-        for (k, v) in fuzzy_text {
-            duplicates_map.entry(k).or_default().extend(v);
-        }
-
-        // Use parallel fuzzy image matching
-        let fuzzy_img = fuzzy_image_match_parallel(&images, 10);
-        println!("DEBUG: Fuzzy image groups: {}", fuzzy_img.len());
-        for (k, v) in fuzzy_img {
-            duplicates_map.entry(k).or_default().extend(v);
-        }
-    }
-
-    let processing_time = start_time.elapsed();
-    println!("⏱️  Processing completed in {:.2?}", processing_time);
-
-    // Store similarity values as we calculate them
-    let mut similarity_cache: HashMap<String, f64> = HashMap::new();
-
-    for (hash, paths) in &duplicates_map {
-        if paths.len() > 1 {
-            println!("\nDuplicate group (hash: {}):", &hash[..10.min(hash.len())]);
-            for p in paths {
-                println!(" - {}", p.display());
-            }
-
-            // Debug text files specifically
-            if paths.iter().all(|f| f.extension().map(|e| e == "txt").unwrap_or(false)) {
-                debug_text_files(paths);
-            }
-
-            // Calculate and store similarity BEFORE quarantining
-            if let Some(similarity) = calculate_similarity_for_group(paths) {
-                similarity_cache.insert(hash.clone(), similarity);
-                println!("DEBUG: Cached similarity for {}: {:.2}%", hash, similarity);
-            }
-
-            print_similarity_for_group(paths);
-        }
-    }
-
     if args.contains(&"--undo".to_string()) {
         undo_quarantine(folder);
         return;
     }
 
-    let total_saved_bytes = quarantine_duplicates(duplicates_map.clone(), folder, dry_run);
-    
-    // Pass the cached similarities to the report function
-    save_json_report_with_cache("report.json", duplicates_map.clone(), total_saved_bytes, similarity_cache);
+    println!("🚀 Starting deduplicator with {} threads", rayon::current_num_threads());
+    let start = std::time::Instant::now();
 
-    if !dry_run {
-        let mb = total_saved_bytes as f64 / (1024.0 * 1024.0);
-        println!("\n✅ Saved {:.2} MB by removing duplicates", mb);
-    } else {
-        println!("\n(Dry Run) Total potential space saving: {:.2} MB", total_saved_bytes as f64 / (1024.0 * 1024.0));
-    }
+    // Collect files - ALLOW 0-BYTE FILES
+    let files = collect_files_parallel(
+        folder,
+        &FileFilter { 
+            min_size: Some(0),  // Changed from 1 to 0
+            max_size: None, 
+            allowed_extensions: None, 
+            modified_after: None 
+        },
+        regex_pattern.as_ref(),
+    );
 
-    println!("\nTotal duplicate groups found: {}", 
-        duplicates_map.iter().filter(|(_, paths)| paths.len() > 1).count());
-}
-fn save_json_report_with_cache(path: &str, map: HashMap<String, Vec<PathBuf>>, saved_bytes: u64, similarity_cache: HashMap<String, f64>) {
-    let groups: Vec<DuplicateGroup> = map.into_iter()
-        .filter(|(_, files)| files.len() > 1)
-        .map(|(hash, files)| {
-            let file_strs: Vec<String> = files.iter().map(|p| p.display().to_string()).collect();
-            
-            // Use cached similarity instead of recalculating
-            let similarity = similarity_cache.get(&hash).copied();
-            
-            println!("DEBUG: Using cached similarity for {}: {:?}", hash, similarity);
+    // Debug what we found
+    debug_file_structure(&files);
+    debug_subfolder_files(&files);  // Add this line
 
-            DuplicateGroup {
-                hash,
-                similarity,
-                files: file_strs,
-            }
-        })
-        .collect();
-
-    let report = FullReport {
-        saved_bytes,
-        saved_mb: saved_bytes as f64 / (1024.0 * 1024.0),
-        groups,
-    };
-
-    let json = serde_json::to_string_pretty(&report).unwrap();
-    std::fs::write(path, json).expect("Failed to write JSON report");
-    println!("\nSaved JSON report to {}", path);
-}
-fn debug_text_files(paths: &Vec<PathBuf>) {
-    println!("\n=== DEBUG: Text File Contents ===");
-    for (i, path) in paths.iter().enumerate() {
-        match std::fs::read_to_string(path) {
-            Ok(content) => {
-                let preview = if content.len() > 100 {
-                    format!("{}...", &content[..100])
-                } else {
-                    content.clone()
-                };
-                println!("File {}: {} ({} bytes)", i+1, path.display(), content.len());
-                println!("Content preview: {:?}", preview);
-                println!("---");
-            }
-            Err(e) => {
-                println!("File {}: {} - ERROR: {}", i+1, path.display(), e);
-            }
-        }
-    }
-    println!("=== END DEBUG ===\n");
-}
-
-fn collect_all_files_parallel(dir: &str, filter: &FileFilter, regex: Option<&Regex>) -> Vec<PathBuf> {
-    println!("🔄 Scanning files in parallel...");
-    
-    WalkDir::new(dir)
-        .into_iter()
-        .par_bridge()  // Convert to parallel iterator
-        .filter_map(|entry| {
-            let entry = entry.ok()?;
-            let path = entry.path();
-
-            // Skip .quarantine and hidden folders
-            if path.components().any(|c| c.as_os_str() == ".quarantine") {
-                return None;
-            }
-            if entry.file_type().is_dir() {
-                return None;
-            }
-
-            let meta = entry.metadata().ok()?;
-            let size = meta.len();
-            let modified = meta.modified().ok()?;
-
-            if let Some(min) = filter.min_size {
-                if size < min {
-                    return None;
-                }
-            }
-
-            if let Some(max) = filter.max_size {
-                if size > max {
-                    return None;
-                }
-            }
-
-            if let Some(after) = filter.modified_after {
-                if modified < after {
-                    return None;
-                }
-            }
-
-            if let Some(ref exts) = filter.allowed_extensions {
-                let file_ext = entry.path().extension()?.to_str()?.to_lowercase();
-                if !exts.contains(&file_ext) {
-                    return None;
-                }
-            }
-
-            if let Some(rgx) = regex {
-                let filename = entry.file_name().to_string_lossy();
-                if !rgx.is_match(&filename) {
-                    return None;
-                }
-            }
-
-            Some(path.to_path_buf())
-        })
-        .collect()
-}
-
-fn calculate_image_similarity_parallel(paths: &Vec<PathBuf>) -> Option<f64> {
-    if paths.len() < 2 {
-        return None;
-    }
-
-    println!("🖼️  Calculating image similarity for {} images in parallel...", paths.len());
-    
-    use img_hash::{HasherConfig, HashAlg};
-    
-    // Parallel image hashing - create hasher in each thread
-    let hash_results: Vec<_> = paths
+    let (images, texts): (Vec<_>, Vec<_>) = files
         .par_iter()
-        .map(|path| {
-            // Create a new hasher for each thread
-            let hasher = HasherConfig::new().hash_alg(HashAlg::Gradient).to_hasher();
-            
-            match img_hash::image::open(path) {
-                Ok(img) => {
-                    let hash = hasher.hash_image(&img);
-                    Some((path.clone(), hash))
-                }
-                Err(e) => {
-                    println!("⚠️  Failed to load {}: {}", path.display(), e);
-                    None
-                }
+        .partition_map(|path| {
+            match path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()) {
+                Some(ext) if matches!(ext.as_str(), "jpg" | "jpeg" | "png" | "gif" | "bmp") => 
+                    rayon::iter::Either::Left(path.clone()),
+                _ => rayon::iter::Either::Right(path.clone()),
             }
-        })
-        .collect();
+        });
 
-    let hashes: Vec<_> = hash_results.into_iter().flatten().collect();
+    println!("📁 Found {} files ({} images, {} other)", files.len(), images.len(), texts.len());
 
-    if hashes.len() < 2 {
-        return Some(100.0); // Exact duplicates
+    // Find duplicates
+    let mut duplicates = group_duplicates_parallel(files, &hash_algo);
+    
+    if use_fuzzy {
+        // Fuzzy image matching
+        let fuzzy_imgs = fuzzy_image_match(&images, 10);
+        for (k, v) in fuzzy_imgs {
+            duplicates.entry(k).or_default().extend(v);
+        }
+        
+        // Fuzzy text matching
+        let fuzzy_texts = fuzzy_text_match(&texts, 80.0);
+        for (k, v) in fuzzy_texts {
+            duplicates.entry(k).or_default().extend(v);
+        }
+        
+        // IMPORTANT: Deduplicate overlapping groups
+        deduplicate_groups(&mut duplicates);
     }
 
-    println!("✅ Successfully hashed {}/{} images", hashes.len(), paths.len());
+    println!("⏱️  Processing completed in {:.1?}", start.elapsed());
 
-    // Parallel similarity calculation - FIX: Clone variables before moving
-    let total_comparisons = hashes.len() * (hashes.len() - 1) / 2;
-    let progress_counter = Arc::new(AtomicUsize::new(0));
+    // Calculate similarities and create cache
+    let mut similarity_cache = HashMap::new();
+    for (hash, paths) in &duplicates {
+        if paths.len() > 1 {
+            let group_type = if hash.starts_with("fuzzy_img") {
+                "🖼️ Fuzzy Image"
+            } else if hash.starts_with("fuzzy_txt") {
+                "📝 Fuzzy Text"
+            } else {
+                "📦 Exact Hash"
+            };
+            
+            println!("\n{} Group ({}): {} files", group_type, &hash[..8], paths.len());
+            for p in paths { println!("   {}", p.display()); }
+            
+            if let Some(sim) = calculate_similarity(paths) {
+                similarity_cache.insert(hash.clone(), sim);
+                println!("   Similarity: {:.1}%", sim);
+            }
+        }
+    }
+
+    // Execute actions
+    let saved_bytes = quarantine_duplicates(&duplicates, folder, dry_run);
+    save_report("report.json", &duplicates, saved_bytes, &similarity_cache);
+
+    println!("\n✅ {} {:.1} MB", 
+        if dry_run { "Would save" } else { "Saved" },
+        saved_bytes as f64 / (1024.0 * 1024.0)
+    );
+}
+
+// Add this function to debug what files are found:
+
+fn debug_file_structure(files: &[PathBuf]) {
+    println!("\n🔍 Debug: Found files:");
+    for file in files {
+        println!("  {}", file.display());
+    }
+    println!("Total files found: {}\n", files.len());
+}
+
+// Add this function to remove overlapping files:
+
+fn deduplicate_groups(duplicates: &mut HashMap<String, Vec<PathBuf>>) {
+    let mut seen_files = std::collections::HashSet::new();
+    let mut keys_to_remove = Vec::new();
+
+    // First pass: collect all files from exact hash matches (highest priority)
+    for (hash, files) in duplicates.iter() {
+        if !hash.starts_with("fuzzy_") && files.len() > 1 {
+            for file in files {
+                seen_files.insert(file.clone());
+            }
+        }
+    }
+
+    // Second pass: remove overlapping files from fuzzy matches
+    for (hash, files) in duplicates.iter_mut() {
+        if hash.starts_with("fuzzy_") {
+            files.retain(|file| !seen_files.contains(file));
+            
+            // If fuzzy group has less than 2 files after deduplication, mark for removal
+            if files.len() < 2 {
+                keys_to_remove.push(hash.clone());
+            } else {
+                // Add remaining files to seen_files to prevent further overlaps
+                for file in files {
+                    seen_files.insert(file.clone());
+                }
+            }
+        }
+    }
+
+    // Remove empty fuzzy groups
+    for key in keys_to_remove {
+        duplicates.remove(&key);
+    }
+
+    println!("🔧 Deduplicated overlapping groups");
+}
+
+// Add this function right after debug_file_structure:
+
+fn debug_subfolder_files(files: &[PathBuf]) {
+    let subfolder_files: Vec<_> = files.iter()
+        .filter(|f| f.components().any(|c| c.as_os_str() == "subfolder"))
+        .collect();
     
-    // Create all comparison pairs first
-    let mut pairs = Vec::new();
-    for i in 0..hashes.len() {
-        for j in i+1..hashes.len() {
-            pairs.push((i, j));
+    println!("\n🗂️  Subfolder files found: {}", subfolder_files.len());
+    for file in &subfolder_files {
+        println!("   📁 {}", file.display());
+        if let Ok(meta) = file.metadata() {
+            println!("      📏 Size: {} bytes", meta.len());
+            if let Ok(content) = std::fs::read_to_string(file) {
+                println!("      📝 Content preview: {:?}", &content[..content.len().min(50)]);
+            }
         }
     }
     
-    let similarities: Vec<f64> = pairs
-        .into_par_iter()
-        .map(|(i, j)| {
-            let dist = hashes[i].1.dist(&hashes[j].1);
-            let bits = hashes[i].1.as_bytes().len() * 8;
-            let sim = 100.0 - (dist as f64 * 100.0 / bits as f64);
-            
-            let current = progress_counter.fetch_add(1, Ordering::Relaxed);
-            if current % 50 == 0 || current == total_comparisons - 1 {
-                println!("📊 Similarity progress: {}/{} comparisons", current + 1, total_comparisons);
-            }
-            
-            sim
-        })
+    let text_files: Vec<_> = files.iter()
+        .filter(|f| f.extension().map(|e| e == "txt").unwrap_or(false))
         .collect();
-
-    if !similarities.is_empty() {
-        let avg = similarities.iter().sum::<f64>() / similarities.len() as f64;
-        println!("✅ Average image similarity: {:.2}%", avg);
-        Some(avg)
-    } else {
-        Some(100.0)
+    
+    println!("\n📝 All text files found: {}", text_files.len());
+    for file in &text_files {
+        println!("   📝 {}", file.display());
+        if let Ok(content) = std::fs::read_to_string(file) {
+            println!("      Content: {:?}", content.trim());
+        }
     }
+    println!();
 }
