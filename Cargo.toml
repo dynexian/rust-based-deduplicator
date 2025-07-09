@@ -1,6 +1,19 @@
 [package]
 name = "rust-based-deduplicator"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 
 [dependencies]
+walkdir = "2.4.0"      
+blake3 = "1.5.0"        
+rayon = "1.8"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+regex = "1"
+strsim = "0.10"            
+sha2 = "0.10"
+xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
+image = { version = "0.23", features = ["jpeg", "png", "gif", "bmp"] }
+img_hash = "3.2.0"
+num_cpus = "1.16" 
+crossbeam = "0.8"

@@ -1,0 +1,14 @@
+[
+  {
+    "original": "./test_folder\\img6.jpg",
+    "quarantined": "./test_folder/.quarantine\\img6.jpg"
+  },
+  {
+    "original": "./test_folder\\img7.jpg",
+    "quarantined": "./test_folder/.quarantine\\img7.jpg"
+  },
+  {
+    "original": "./test_folder\\file3.txt",
+    "quarantined": "./test_folder/.quarantine\\file3.txt"
+  }
+]

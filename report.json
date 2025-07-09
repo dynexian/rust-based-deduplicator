@@ -1,0 +1,30 @@
+{
+  "saved_bytes": 1440186,
+  "saved_mb": 1.3734683990478516,
+  "groups": [
+    {
+      "hash": "fuzzy_img_./test_folder\\img5.jpg",
+      "similarity": 85.9375,
+      "files": [
+        "./test_folder\\img5.jpg",
+        "./test_folder\\img6.jpg"
+      ]
+    },
+    {
+      "hash": "fuzzy_img_./test_folder\\img3.jpg",
+      "similarity": 93.75,
+      "files": [
+        "./test_folder\\img3.jpg",
+        "./test_folder\\img7.jpg"
+      ]
+    },
+    {
+      "hash": "./test_folder\\file1.txt",
+      "similarity": 83.33333333333333,
+      "files": [
+        "./test_folder\\file1.txt",
+        "./test_folder\\file3.txt"
+      ]
+    }
+  ]
+}
