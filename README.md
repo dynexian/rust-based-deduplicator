@@ -70,7 +70,7 @@ cargo run -- ./test_folder --fuzzy --dry-run --hash blake3
 | `--fuzzy` | Enable fuzzy matching for similar files | `--fuzzy` |
 | `--dry-run` | Preview mode (no files moved) | `--dry-run` |
 | `--hash <algo>` | Hash algorithm: `blake3`, `sha256`, `xxhash` | `--hash sha256` |
-| `--regex <pattern>` | Filter files by regex pattern | `--regex ".*\\.pdf$"` |
+| `--regex <pattern>` | Filter files by regex pattern | `--regex ".*\\.txt$"` |
 | `--undo` | Restore all quarantined files | `--undo` |
 
 ## How It Works
@@ -128,7 +128,7 @@ cargo run -- ./my_photos --undo
 - **Normalization**: Handles different line endings and whitespace
 
 ### Image Files
-- **Extensions**: `.jpg`, `.jpeg`, `.png`, `.gif`, `.bmp`, `.webp`
+- **Extensions**: `.jpg`, `.jpeg`, `.png`, `.gif`, `.bmp`
 - **Fuzzy matching**: Perceptual hashing with configurable distance threshold
 - **Detection**: Finds visually similar images regardless of format/size differences
 
